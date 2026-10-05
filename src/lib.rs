@@ -34,12 +34,55 @@ pub enum NotifyError {
     Closed(Bytes),
 }
 
+/// A failed notification. Carries the original message so the caller can
+/// resend it if it wants to; the library itself never retries.
 #[derive(Debug, thiserror::Error)]
-pub enum DeliveryError {
-    #[error("server responded with {0}")]
-    Status(StatusCode),
-    #[error("request failed: {0}")]
-    Request(#[from] reqwest::Error),
+#[error("{kind}")]
+pub struct DeliveryError {
+    pub message: Bytes,
+    pub kind: FailureKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FailureKind {
+    /// The server answered with a non-2xx status.
+    #[error("server responded with {status}: {body}")]
+    Status { status: StatusCode, body: String },
+    /// No response within the configured timeout.
+    #[error("request timed out")]
+    Timeout,
+    /// The server could not be reached.
+    #[error("could not connect: {}", error_chain(.0))]
+    Connect(reqwest::Error),
+    /// Any other transport error, e.g. the connection dropped mid-request.
+    #[error("request failed: {}", error_chain(.0))]
+    Request(reqwest::Error),
+}
+
+impl DeliveryError {
+    /// Whether resending might succeed. False only for 4xx responses other
+    /// than 429, where the server rejected the message itself.
+    pub fn is_retryable(&self) -> bool {
+        match &self.kind {
+            FailureKind::Status { status, .. } => {
+                !status.is_client_error() || *status == StatusCode::TOO_MANY_REQUESTS
+            }
+            FailureKind::Timeout | FailureKind::Connect(_) | FailureKind::Request(_) => true,
+        }
+    }
+}
+
+/// reqwest's own message is often just "error sending request"; the actual
+/// cause (connection refused, DNS failure, ...) is further down the chain.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// Resolves to the outcome of a single notification. Drop it to fire-and-forget.
@@ -88,16 +131,31 @@ impl Notifier {
 async fn dispatch(mut rx: mpsc::Receiver<Job>, client: Client, url: Url, max_in_flight: usize) {
     futures::stream::poll_fn(|cx| rx.poll_recv(cx))
         .for_each_concurrent(max_in_flight, |job| {
-            let request = client.post(url.clone()).body(job.body);
+            let request = client.post(url.clone()).body(job.body.clone());
             async move {
-                let result = match request.send().await {
-                    Ok(resp) if resp.status().is_success() => Ok(()),
-                    Ok(resp) => Err(DeliveryError::Status(resp.status())),
-                    Err(err) => Err(err.into()),
-                };
+                let result = send(request).await.map_err(|kind| DeliveryError { message: job.body, kind });
                 // The caller may have dropped its Delivery; that's fine.
                 let _ = job.done.send(result);
             }
         })
         .await;
+}
+
+async fn send(request: reqwest::RequestBuilder) -> Result<(), FailureKind> {
+    let classify = |err: reqwest::Error| {
+        if err.is_timeout() {
+            FailureKind::Timeout
+        } else if err.is_connect() {
+            FailureKind::Connect(err)
+        } else {
+            FailureKind::Request(err)
+        }
+    };
+    let resp = request.send().await.map_err(classify)?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text().await.map_err(classify)?;
+    Err(FailureKind::Status { status, body })
 }
